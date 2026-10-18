@@ -30,7 +30,7 @@ def _parse_arting_line(raw_line: str) -> str | None:
     # ── 标准 SSE 行 ──────────────────────────────────────
     if line.startswith("data:"):
         payload = line[5:].strip()
-        if payload in ("[DONE]", ""):
+        if payload in ("[DONE]", "") or payload.startswith(":"):
             return None
         try:
             obj = json.loads(payload)

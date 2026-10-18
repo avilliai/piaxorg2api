@@ -1,4 +1,4 @@
-﻿import json, uuid, re
+import json, uuid, re
 import httpx
 
 BASE = "https://piax-api.piax.org"
@@ -68,7 +68,7 @@ REAL_MODELS = list(MODEL_AGENT.keys())
 AVAILABLE_MODELS = [{"id": f"piax/{m}", "object": "model", "owned_by": "piax"} for m in REAL_MODELS]
 
 
-async def stream_chat(auth_token: str, messages: list[dict], model: str = "gpt-5", files=None):
+async def stream_chat(auth_token: str, messages: list[dict], model: str = "agnes-2.5-flash", files=None):
     conversation_id = str(uuid.uuid4())
     model_name = model.removeprefix("piax/")
 
@@ -100,9 +100,7 @@ async def stream_chat(auth_token: str, messages: list[dict], model: str = "gpt-5
         history.append(f"{role}: {content}")
     query = "\n".join(history)
     files = files or []
-    agent_id = MODEL_AGENT.get(model_name)
-    if not agent_id:
-        raise ValueError(f"Unknown Piax model: {model_name}; call /v1/models first")
+    agent_id = MODEL_AGENT.get(model_name) or "422"
 
     payload = {
         "device": {"deviceType": "pc", "osPlatform": "web"},
@@ -120,21 +118,34 @@ async def stream_chat(auth_token: str, messages: list[dict], model: str = "gpt-5
         "origin": "https://www.piax.org",
         "referer": "https://www.piax.org/",
     }
-    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
-        async with client.stream("POST", BASE + CHAT_PATH, headers=headers, json=payload) as r:
-            r.raise_for_status()
-            async for line in r.aiter_lines():
-                if not line:
-                    continue
-                # Detect upstream error in stream
-                if line.startswith("data:") and '"event":"error"' in line:
-                    try:
-                        err_obj = json.loads(line[5:].strip())
-                        ans = err_obj.get("answer") or err_obj.get("message") or "Piax upstream error"
-                        raise RuntimeError(f"Piax upstream error ({err_obj.get('code', 500)}): {ans}")
-                    except json.JSONDecodeError:
-                        pass
-                yield line if line.startswith("data:") else "data: " + line
+
+    async def _do_stream(aid: str):
+        p = {**payload, "agentId": aid}
+        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+            async with client.stream("POST", BASE + CHAT_PATH, headers=headers, json=p) as r:
+                r.raise_for_status()
+                async for line in r.aiter_lines():
+                    if not line or line.startswith(":"):
+                        continue
+                    if line.startswith("data:") and '"event":"error"' in line:
+                        try:
+                            err_obj = json.loads(line[5:].strip())
+                            ans = err_obj.get("answer") or err_obj.get("message") or "Piax upstream error"
+                            raise RuntimeError(f"Piax upstream error ({err_obj.get('code', 500)}): {ans}")
+                        except json.JSONDecodeError:
+                            pass
+                    yield line if line.startswith("data:") else "data: " + line
+
+    try:
+        async for line in _do_stream(agent_id):
+            yield line
+    except RuntimeError as e:
+        err_msg = str(e)
+        if ("does not support this feature" in err_msg or "subscription plan" in err_msg) and agent_id != "422":
+            async for line in _do_stream("422"):
+                yield line
+        else:
+            raise
 
 
 async def upload_file_to_arting(auth_token: str, image_url_or_base64: str) -> dict:
@@ -143,8 +154,19 @@ async def upload_file_to_arting(auth_token: str, image_url_or_base64: str) -> di
     return {"url": image_url_or_base64, "type": "image"}
 
 
+async def get_daily_status(token: str) -> dict:
+    headers = {"authorization": token, "content-type": "application/json", "origin": "https://www.piax.org", "referer": "https://www.piax.org/"}
+    async with httpx.AsyncClient(timeout=30) as c:
+        r = await c.post(
+            BASE + "/trade-api/trade/daily/status",
+            headers=headers,
+            json={"device": {"deviceType": "pc", "osPlatform": "web"}},
+        )
+        return r.json()
+
+
 async def claim_daily(token: str) -> dict:
-    headers = {"authorization": token, "content-type": "application/json", "origin": "https://www.piax.org"}
+    headers = {"authorization": token, "content-type": "application/json", "origin": "https://www.piax.org", "referer": "https://www.piax.org/"}
     async with httpx.AsyncClient(timeout=30) as c:
         r = await c.post(
             BASE + "/trade-api/trade/daily/claim",
@@ -155,7 +177,7 @@ async def claim_daily(token: str) -> dict:
 
 
 async def get_balance(token: str) -> dict:
-    headers = {"authorization": token, "content-type": "application/json", "origin": "https://www.piax.org"}
+    headers = {"authorization": token, "content-type": "application/json", "origin": "https://www.piax.org", "referer": "https://www.piax.org/"}
     async with httpx.AsyncClient(timeout=30) as c:
         r = await c.post(
             BASE + "/trade-api/trade/subscription/getUserSubscriptionStatus",
