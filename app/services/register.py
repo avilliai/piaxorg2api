@@ -14,30 +14,43 @@ def generate_password(length=12):
 
 def extract_verification_code(text):
     import re
-    m = re.search(r'\b(\d{6})\b', text or '')
-    return m.group(1) if m else None
+    text = text or ''
+    # Piax's mail template labels the code explicitly.  Prefer that match so
+    # dates, message ids and footer numbers cannot win over the actual code.
+    matches = re.findall(r'(?:verification\s*code|验证码)\s*(?:(?:is|为|是)\s*)?[:：]?\s*([0-9]{6})', text, re.I)
+    if matches: return matches[-1]
+    codes = re.findall(r'\b([0-9]{6})\b', text)
+    return codes[-1] if codes else None
 
-async def wait_for_code(service, jwt, timeout=100, interval=5):
+async def wait_for_code(service, jwt, timeout=100, interval=5, baseline=""):
     loop = asyncio.get_running_loop()
     for _ in range(max(1, timeout // interval)):
         content = await loop.run_in_executor(None, service.fetch_first_email, jwt)
-        code = extract_verification_code(content)
-        if code: return code
+        # Ignore messages present before this verification request.
+        if content and content != baseline:
+            code = extract_verification_code(content)
+            if code: return code
         await asyncio.sleep(interval)
     raise TimeoutError('verification code timeout')
 
 async def register_once(worker_id=1):
-    service = OutlookEmailService() if os.getenv('EMAIL_MODE','worker').lower() == 'outlook' else EmailService()
+    service = OutlookEmailService() if os.getenv('EMAIL_MODE').lower() == 'outlook' else EmailService()
     mailbox = await service.create_email() if hasattr(service, 'wait_for_code') else None
     if mailbox:
         email = mailbox.address; jwt = mailbox
     else:
         jwt, email = service.create_email()
+    outlook_baseline = 0
+    if mailbox:
+        outlook_baseline = await service.latest_uid(jwt)
+    baseline = ""
+    if not mailbox:
+        baseline = service.fetch_first_email(jwt) or ""
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(f'{BASE}/user-api/user/sendEmailVerifyCode', json={
             'channel':'pia','email':email,'device':{'deviceType':'pc','osPlatform':'web'}})
         r.raise_for_status()
-        code = await service.wait_for_code(jwt) if mailbox else await wait_for_code(service, jwt, int(os.getenv('POLL_TIMEOUT','100')), int(os.getenv('POLL_INTERVAL','5')))
+        code = await service.wait_for_code(jwt, outlook_baseline) if mailbox else await wait_for_code(service, jwt, int(os.getenv('POLL_TIMEOUT','100')), int(os.getenv('POLL_INTERVAL','5')), baseline)
         r = await client.post(f'{BASE}/user-api/user/emailLogin', json={
             'email':email,'code':code,'channel':'pia','device':{'deviceType':'pc','osPlatform':'web'}})
         r.raise_for_status(); data = r.json()

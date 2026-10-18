@@ -1,4 +1,4 @@
-"""
+﻿"""
 GET /v1/models
 返回当前支持的模型列表（OpenAI 兼容格式）。
 """
@@ -19,12 +19,19 @@ router = APIRouter()
 )
 async def list_models():
     try:
-        html=(await httpx.AsyncClient(timeout=20).get('https://www.piax.org/en/home')).text
-        found=re.findall(r'\\"id\\":\\"(\d+)\\".*?\\"name\\":\\"([^\\"]+)\\".*?\\"path\\":\\"([^\\"]+)\\"',html)
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            html = (await client.get('https://www.piax.org/home')).text
+        found = re.findall(r'\\"id\\":\\"(\d+)\\".*?\\"name\\":\\"([^\\"]+)\\".*?\\"path\\":\\"([^\\"]+)\\"', html)
         if found:
             from app.services.arting_client import MODEL_AGENT
-            MODEL_AGENT.update({p:i for i,n,p in found})
-            return {"object":"list","data":[{"id":f"piax/{p}","object":"model","owned_by":"piax","created":int(time.time()),"name":n,"agent_id":i} for i,n,p in found]}
+            MODEL_AGENT.update({p: i for i, n, p in found})
+            return {
+                "object": "list",
+                "data": [
+                    {"id": f"piax/{p}", "object": "model", "owned_by": "piax", "created": int(time.time()), "name": n, "agent_id": i}
+                    for i, n, p in found
+                ],
+            }
     except Exception:
         pass
     return {

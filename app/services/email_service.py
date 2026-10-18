@@ -81,9 +81,14 @@ class EmailService:
 
             if res.status_code == 200:
                 data = res.json()
-                if data["results"]:
-                    raw_email_content = data["results"][0]["raw"]
-                    return raw_email_content
+                results = data.get("results") or []
+                if results:
+                    # The API returns newest messages first.  Returning one
+                    # message is important: concatenating the inbox makes the
+                    # verifier pick a code from an older message (often the
+                    # same code on every registration attempt).
+                    first = results[0]
+                    return str(first.get("raw", "")) if isinstance(first, dict) else None
                 return None
             else:
                 return None
