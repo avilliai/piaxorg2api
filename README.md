@@ -105,8 +105,8 @@ piax/deepseek-v4-pro
 
 ```env
 EMAIL_MODE=worker
-WORKER_DOMAIN=newmail.1840094972.workers.dev
-EMAIL_DOMAIN=yuweidi.love
+WORKER_DOMAIN=.....
+EMAIL_DOMAIN=.....
 ADMIN_PASSWORD=...
 ```
 
