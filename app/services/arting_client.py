@@ -1,5 +1,7 @@
-import json, uuid, re
+﻿import json, uuid, re, logging
 import httpx
+
+logger = logging.getLogger(__name__)
 
 BASE = "https://piax-api.piax.org"
 CHAT_PATH = "/ai-api/ai/agent/chatStream"
@@ -64,26 +66,68 @@ MODEL_AGENT = {
     "mistral-large-3-2512": "121",
 }
 
+# 扩展别名映射，支持用户常用的命名变体（如点号、横线、无横线等）
+ALIAS_MAP = {
+    "gpt-5.6-luna": "183",
+    "gpt-5-6-luna": "183",
+    "gpt5.6-luna": "183",
+    "gpt-5.6-terra": "184",
+    "gpt-5-6-terra": "184",
+    "gpt-5.6-sol": "185",
+    "gpt-5-6-sol": "185",
+    "gpt-5.5": "165",
+    "gpt-5.5-pro": "166",
+    "claude-sonnet-5.5": "427",
+    "claude-opus-5.5": "418",
+    "claude-sonnet-4.6": "139",
+    "claude-opus-4.5": "119",
+    "gemini-3.7-flash": "199",
+    "gemini-3.6-flash": "187",
+    "gemini-3.5-flash": "172",
+    "gemini-2.5-pro": "37",
+    "gemini-2.5-flash": "38",
+    "glm-5.3-flash": "203",
+    "glm-5.3": "200",
+    "glm-5.2": "178",
+    "grok-4.7": "415",
+    "grok-4.6": "197",
+    "grok-4.5": "182",
+    "kimi-k.3": "186",
+    "kimi-k-3": "186",
+    "kimi-k2.6": "163",
+    "kimi-k2.5": "132",
+    "qwen3.8-max": "201",
+    "qwen3.7-max": "173",
+    "qwen3.6-plus": "161",
+    "minimax-m2.7": "150",
+    "agnes": "422",
+}
+MODEL_AGENT.update(ALIAS_MAP)
+
 REAL_MODELS = list(MODEL_AGENT.keys())
 AVAILABLE_MODELS = [{"id": f"piax/{m}", "object": "model", "owned_by": "piax"} for m in REAL_MODELS]
+
+
+def resolve_agent_id(model_name: str) -> str:
+    cleaned = model_name.removeprefix("piax/").strip().lower()
+    if cleaned in MODEL_AGENT:
+        return MODEL_AGENT[cleaned]
+    # 替换点为短横线再查
+    normalized = cleaned.replace(".", "-")
+    if normalized in MODEL_AGENT:
+        return MODEL_AGENT[normalized]
+    # 去除所有点和短横线再模糊匹配
+    clean_alnum = re.sub(r"[^a-z0-9]", "", cleaned)
+    for k, v in MODEL_AGENT.items():
+        if re.sub(r"[^a-z0-9]", "", k) == clean_alnum:
+            return v
+    return "422"
 
 
 async def stream_chat(auth_token: str, messages: list[dict], model: str = "agnes-2.5-flash", files=None):
     conversation_id = str(uuid.uuid4())
     model_name = model.removeprefix("piax/")
-
-    if model_name not in MODEL_AGENT:
-        try:
-            async with httpx.AsyncClient(timeout=15, follow_redirects=True) as catalog_client:
-                page = (await catalog_client.get("https://www.piax.org/home")).text
-            for mid, name, path in re.findall(
-                r'\\"id\\":\\"(\d+)\\".*?\\"name\\":\\"([^\\"]+)\\".*?\\"path\\":\\"([^\\"]+)\\"', page
-            ):
-                MODEL_AGENT[path] = mid
-                if path == model_name or name.lower() == model_name.lower():
-                    MODEL_AGENT[model_name] = mid
-        except Exception:
-            pass
+    agent_id = resolve_agent_id(model_name)
 
     history = []
     for m in messages:
@@ -100,7 +144,6 @@ async def stream_chat(auth_token: str, messages: list[dict], model: str = "agnes
         history.append(f"{role}: {content}")
     query = "\n".join(history)
     files = files or []
-    agent_id = MODEL_AGENT.get(model_name) or "422"
 
     payload = {
         "device": {"deviceType": "pc", "osPlatform": "web"},
@@ -112,6 +155,7 @@ async def stream_chat(auth_token: str, messages: list[dict], model: str = "agnes
         "inputs": {"tools.enable": "false"},
     }
     headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         "accept": "text/event-stream, application/json",
         "content-type": "application/json",
         "authorization": auth_token,
@@ -121,19 +165,29 @@ async def stream_chat(auth_token: str, messages: list[dict], model: str = "agnes
 
     async def _do_stream(aid: str):
         p = {**payload, "agentId": aid}
-        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+        timeout = httpx.Timeout(connect=15.0, read=90.0, write=15.0, pool=15.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             async with client.stream("POST", BASE + CHAT_PATH, headers=headers, json=p) as r:
                 r.raise_for_status()
                 async for line in r.aiter_lines():
                     if not line or line.startswith(":"):
                         continue
-                    if line.startswith("data:") and '"event":"error"' in line:
-                        try:
-                            err_obj = json.loads(line[5:].strip())
-                            ans = err_obj.get("answer") or err_obj.get("message") or "Piax upstream error"
-                            raise RuntimeError(f"Piax upstream error ({err_obj.get('code', 500)}): {ans}")
-                        except json.JSONDecodeError:
-                            pass
+                    # 严格捕获 upstream 错误事件：error / bill_message
+                    if line.startswith("data:"):
+                        payload_str = line[5:].strip()
+                        if payload_str == "error":
+                            raise RuntimeError("Piax upstream error: model busy / error")
+                        if '"event":"error"' in line or '"event":"bill_message"' in line:
+                            try:
+                                err_obj = json.loads(payload_str)
+                                code = err_obj.get("code", 500)
+                                ans = err_obj.get("answer") or err_obj.get("message") or ""
+                                event_type = err_obj.get("event")
+                                if event_type == "bill_message" or code == 401 or "balance" in ans.lower() or "insufficient" in ans.lower():
+                                    raise RuntimeError(f"Piax quota exhausted (code {code}): {ans or 'insufficient balance'}")
+                                raise RuntimeError(f"Piax upstream error ({code}): {ans or event_type}")
+                            except json.JSONDecodeError:
+                                pass
                     yield line if line.startswith("data:") else "data: " + line
 
     try:
@@ -155,8 +209,14 @@ async def upload_file_to_arting(auth_token: str, image_url_or_base64: str) -> di
 
 
 async def get_daily_status(token: str) -> dict:
-    headers = {"authorization": token, "content-type": "application/json", "origin": "https://www.piax.org", "referer": "https://www.piax.org/"}
-    async with httpx.AsyncClient(timeout=30) as c:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "authorization": token,
+        "content-type": "application/json",
+        "origin": "https://www.piax.org",
+        "referer": "https://www.piax.org/"
+    }
+    async with httpx.AsyncClient(timeout=15) as c:
         r = await c.post(
             BASE + "/trade-api/trade/daily/status",
             headers=headers,
@@ -166,8 +226,14 @@ async def get_daily_status(token: str) -> dict:
 
 
 async def claim_daily(token: str) -> dict:
-    headers = {"authorization": token, "content-type": "application/json", "origin": "https://www.piax.org", "referer": "https://www.piax.org/"}
-    async with httpx.AsyncClient(timeout=30) as c:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "authorization": token,
+        "content-type": "application/json",
+        "origin": "https://www.piax.org",
+        "referer": "https://www.piax.org/"
+    }
+    async with httpx.AsyncClient(timeout=15) as c:
         r = await c.post(
             BASE + "/trade-api/trade/daily/claim",
             headers=headers,
@@ -177,8 +243,14 @@ async def claim_daily(token: str) -> dict:
 
 
 async def get_balance(token: str) -> dict:
-    headers = {"authorization": token, "content-type": "application/json", "origin": "https://www.piax.org", "referer": "https://www.piax.org/"}
-    async with httpx.AsyncClient(timeout=30) as c:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "authorization": token,
+        "content-type": "application/json",
+        "origin": "https://www.piax.org",
+        "referer": "https://www.piax.org/"
+    }
+    async with httpx.AsyncClient(timeout=15) as c:
         r = await c.post(
             BASE + "/trade-api/trade/subscription/getUserSubscriptionStatus",
             headers=headers,

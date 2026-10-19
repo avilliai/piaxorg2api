@@ -30,10 +30,12 @@ RETRY_DELAY_MAX: float = float(os.getenv("CHAT_RETRY_DELAY_MAX", "10"))
 
 
 async def _report_upstream_failure(token_manager: TokenManager, auth_token: str, exc: Exception):
-    if "100005" in str(exc):
+    err_str = str(exc).strip()
+    reason = f"{type(exc).__name__}: {err_str}" if err_str else repr(exc)
+    if "100005" in reason:
         await token_manager.recover_auth_failure(auth_token)
     else:
-        await token_manager.report_request_failure(auth_token, str(exc))
+        await token_manager.report_request_failure(auth_token, reason)
 
 
 # ──────────────────────────────────────────────

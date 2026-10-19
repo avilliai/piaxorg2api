@@ -1,4 +1,4 @@
-import asyncio, json, logging, os, time
+﻿import asyncio, json, logging, os, time
 from datetime import datetime, timezone
 from pathlib import Path
 from fastapi import HTTPException
@@ -20,10 +20,10 @@ class TokenManager:
         self.active_pool_size = int(os.getenv('ACTIVE_POOL_SIZE', '3'))
         self.last_check_date = get_today_utc_str()
         self.min_standby_threshold = int(os.getenv('MIN_STANDBY_THRESHOLD', '5'))
-        self.auto_replenish_batch = int(os.getenv('AUTO_REPLENISH_BATCH', '2'))
+        self.auto_replenish_batch = int(os.getenv('AUTO_REPLENISH_BATCH', '3'))
         self._replenishing = False
         self._last_replenish_attempt = 0
-        self._replenish_cooldown = int(os.getenv('REPLENISH_COOLDOWN', '120'))
+        self._replenish_cooldown = int(os.getenv('REPLENISH_COOLDOWN', '30'))
 
     async def load(self):
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -31,10 +31,14 @@ class TokenManager:
         self.tokens = []
         for i, x in enumerate(raw, 1):
             state = x.get('state')
+            rem = x.get('remaining', 0)
             if not state:
-                state = 'active' if i <= self.active_pool_size else 'standby'
+                state = 'active' if (i <= self.active_pool_size and rem > 0) else 'standby'
             if x.get('disabled', False):
                 state = 'disabled'
+            # 如果初始读取就是 0 额度，不能作为 active
+            if state == 'active' and rem <= 0:
+                state = 'exhausted'
 
             self.tokens.append({
                 'id': i,
@@ -45,7 +49,7 @@ class TokenManager:
                 'token': x.get('token', ''),
                 'state': state,
                 'disabled': bool(x.get('disabled', False)),
-                'remaining': x.get('remaining', 0),
+                'remaining': rem,
                 'is_alive': bool(x.get('is_alive', True)),
                 'last_claim_date': x.get('last_claim_date', ''),
                 'error_count': 0,
@@ -70,36 +74,42 @@ class TokenManager:
             return obj
 
         try:
-            # 1. Claim daily if not claimed today
+            # 1. 每日签到领 1000 积分
             if obj.get('last_claim_date') != today:
-                claim_res = await claim_daily(token)
-                if claim_res.get('code') == 1:
-                    obj['last_claim_date'] = today
-                    logger.info("Account %s daily claim success (1000 points)", obj.get('email'))
+                try:
+                    claim_res = await claim_daily(token)
+                    if claim_res.get('code') == 1:
+                        obj['last_claim_date'] = today
+                        logger.info("Account %s daily claim success (1000 points)", obj.get('email'))
+                except Exception as ce:
+                    ce_msg = f"{type(ce).__name__}: {ce}".rstrip(": ")
+                    logger.warning("Account %s daily claim request failed: %s", obj.get('email'), ce_msg)
 
-            # 2. Query balance
+            # 2. 查询当前余额
             status = await get_balance(token)
             if status.get('code') == 1:
                 plan = status.get('subscriptionPlan') or {}
                 obj['remaining'] = plan.get('subscriptionBalance', 0) + plan.get('totalityBalance', 0)
                 obj['is_alive'] = True
                 obj['error_count'] = 0
+                if obj['remaining'] <= 0:
+                    obj['state'] = 'exhausted'
             else:
                 logger.warning("Account %s balance check failed: %s", obj.get('email'), status)
-                # If upstream indicates auth error, attempt recovery
-                if status.get('code') == 0 or 'user not exist' in str(status):
+                if status.get('code') == 0 or 'user not exist' in str(status) or '401' in str(status):
                     await self.recover_auth_failure(token)
         except Exception as exc:
-            logger.warning('Token id=%s (%s) check failed: %s', obj.get('id'), obj.get('email'), exc)
+            exc_msg = f"{type(exc).__name__}: {exc}".rstrip(": ")
+            logger.warning('Token id=%s (%s) check failed: %s', obj.get('id'), obj.get('email'), exc_msg)
             if '401' in str(exc) or 'user not exist' in str(exc):
                 await self.recover_auth_failure(token)
         return obj
 
     async def ensure_active_pool(self):
-        """Maintains the active pool: promotes standby accounts when active accounts are exhausted."""
+        """维护 Active 活跃池：将额度耗尽的账号标记为 exhausted，并及时从 standby 提拔健康账号。"""
         today = get_today_utc_str()
 
-        # Check if UTC day rolled over
+        # UTC 新的一天重置 exhausted 状态账号为 standby 尝试领新额度
         if today != self.last_check_date:
             self.last_check_date = today
             logger.info("New day detected (%s). Resetting exhausted accounts to standby.", today)
@@ -107,47 +117,63 @@ class TokenManager:
                 if x['state'] == 'exhausted' and not x['disabled']:
                     x['state'] = 'standby'
 
-        # Current usable active accounts
+        # 1. 检查并清理当前 active 池中额度耗尽或不可用的账号
+        for x in self.tokens:
+            if x['state'] == 'active':
+                if x['disabled'] or not x['is_alive'] or x['remaining'] <= 0:
+                    logger.info("Retiring exhausted active account %s (remaining=%d, alive=%s)",
+                                x.get('email'), x['remaining'], x['is_alive'])
+                    x['state'] = 'exhausted' if not x['disabled'] else 'disabled'
+
+        # 2. 当前真正可用的 active 账号
         active_usable = [
             x for x in self.tokens
             if x['state'] == 'active' and not x['disabled'] and x['is_alive'] and x['remaining'] > 0
         ]
 
+        # 3. 补充不足的 active 槽位
         needed = self.active_pool_size - len(active_usable)
         if needed > 0:
             standby_candidates = [
                 x for x in self.tokens
                 if x['state'] == 'standby' and not x['disabled'] and x['is_alive']
             ]
-            for candidate in standby_candidates[:needed]:
+            for candidate in standby_candidates:
+                if needed <= 0:
+                    break
                 logger.info("Promoting standby account %s to active pool", candidate.get('email'))
                 candidate['state'] = 'active'
                 await self._claim_and_update(candidate)
+                # 只有确认有额度才算作补充成功
+                if candidate['remaining'] > 0 and candidate['is_alive']:
+                    needed -= 1
+                else:
+                    candidate['state'] = 'exhausted'
 
         await self._save()
         self.trigger_auto_replenish_if_needed()
 
-    def trigger_auto_replenish_if_needed(self):
-        """Triggers background auto-registration if standby accounts drop below threshold."""
-        if self._replenishing:
+    def trigger_auto_replenish_if_needed(self, force: bool = False):
+        """当 standby 账号数量低于阈值时，自动触发后台自动注册。"""
+        if self._replenishing and not force:
             return
         now = time.time()
-        if now - self._last_replenish_attempt < self._replenish_cooldown:
+        if not force and (now - self._last_replenish_attempt < self._replenish_cooldown):
             return
 
         standby_count = sum(
             1 for x in self.tokens
-            if x['state'] == 'standby' and not x['disabled'] and x['is_alive']
+            if x['state'] == 'standby' and not x['disabled'] and x['is_alive'] and x.get('remaining', 0) > 0
         )
-        if standby_count < self.min_standby_threshold:
+        if standby_count < self.min_standby_threshold or force:
             logger.info(
-                "Standby pool count (%d) below threshold (%d). Scheduling background auto-replenish.",
+                "Standby usable count (%d) below threshold (%d). Scheduling background auto-replenish.",
                 standby_count, self.min_standby_threshold
             )
             asyncio.create_task(self._auto_replenish_task())
 
     async def _auto_replenish_task(self):
-        """Quietly registers candidate accounts from file and adds them to standby pool."""
+        """自动从 Outlook 邮箱文件注册新账号，并补充进 standby 池。"""
         if self._replenishing:
             return
         self._replenishing = True
@@ -169,7 +195,7 @@ class TokenManager:
                             'token': acc.get('token', ''),
                             'state': 'standby',
                             'disabled': False,
-                            'remaining': acc.get('remaining', 0),
+                            'remaining': acc.get('remaining', 6000),
                             'is_alive': True,
                             'last_claim_date': acc.get('last_claim_date', ''),
                             'error_count': 0,
@@ -177,30 +203,34 @@ class TokenManager:
                         existing_emails.add(acc.get('email'))
                 await self._save()
                 logger.info("Auto-replenish completed: added %d new standby accounts", len(new_accs))
+                # 再次检查并填充活跃池
+                await self.ensure_active_pool()
         except Exception as e:
             logger.warning("Auto-replenish task error: %s", e)
             if "frequent" in str(e).lower() or "too frequent" in str(e).lower():
-                # On upstream rate-limit, back off for 5 minutes
                 self._last_replenish_attempt = time.time() + 300
         finally:
             self._replenishing = False
 
     async def get_next(self) -> str:
         async with self.lock:
-            # 1. Ensure active pool has healthy accounts
+            # 1. 确保活跃池有可用账号
             await self.ensure_active_pool()
 
-            # 2. Get active accounts with remaining > 0
+            # 2. 获取 remaining > 0 的可用 active 账号
             available = [
                 x for x in self.tokens
                 if x['state'] == 'active' and not x['disabled'] and x['is_alive'] and x['remaining'] > 0
             ]
 
-            # 3. Fallback: if no active account with remaining > 0, check all alive active accounts
+            # 3. 若无可用 active 账号，尝试直接触发同步补充注册
             if not available:
+                logger.warning("All active tokens exhausted! Attempting emergency replenishment...")
+                await self._auto_replenish_task()
+                await self.ensure_active_pool()
                 available = [
                     x for x in self.tokens
-                    if x['state'] == 'active' and not x['disabled'] and x['is_alive']
+                    if x['state'] == 'active' and not x['disabled'] and x['is_alive'] and x['remaining'] > 0
                 ]
 
             if not available:
@@ -211,11 +241,11 @@ class TokenManager:
             return obj['token']
 
     async def report_request_success(self, token: str):
-        # Slightly decrement estimated points or check balance
         for x in self.tokens:
             if x['token'] == token:
                 if x['remaining'] > 0:
                     x['remaining'] -= 10
+                x['error_count'] = 0
                 if x['remaining'] <= 0:
                     x['state'] = 'exhausted'
                     logger.info("Account %s exhausted quota, rotating active pool", x.get('email'))
@@ -223,26 +253,37 @@ class TokenManager:
                 break
 
     async def report_request_failure(self, token: str, reason: str = ''):
-        logger.warning('Piax request failed for token %s... : %s', token[:15], reason)
+        r_str = str(reason).lower()
+        logger.warning('Piax request failed for token %s... : %s', token[:15], reason or 'unknown')
         obj = next((x for x in self.tokens if x['token'] == token), None)
         if not obj:
             return
 
         obj['error_count'] = obj.get('error_count', 0) + 1
 
-        # Check for quota exhaustion
-        if 'quota' in reason.lower() or 'balance' in reason.lower() or 'insufficient' in reason.lower():
+        # 1. 额度耗尽 / 套餐限制
+        if any(k in r_str for k in ['quota', 'balance', 'insufficient', 'bill_message', 'plan', 'exhausted']):
             obj['remaining'] = 0
             obj['state'] = 'exhausted'
-            logger.info("Account %s marked as exhausted. Triggering active pool rotation.", obj.get('email'))
+            logger.info("Account %s marked as exhausted due to: %s. Rotating pool.", obj.get('email'), reason)
             await self.ensure_active_pool()
 
-        # Check for auth failure / token expiration
-        elif '401' in reason or 'user not exist' in reason.lower() or 'token' in reason.lower():
-            await self.recover_auth_failure(token)
+        # 2. 凭证失效 / 401 认证失败
+        elif any(k in r_str for k in ['401', 'user not exist', 'unauthorized', 'token invalid']):
+            logger.info("Account %s auth failed, attempting recovery...", obj.get('email'))
+            recovered = await self.recover_auth_failure(token)
+            if not recovered:
+                obj['state'] = 'exhausted'
+                await self.ensure_active_pool()
+
+        # 3. 连续失败达到 2 次（网络超时、服务端断连等）自动下线该账号，避免拖垮用户重试
+        elif obj['error_count'] >= 2:
+            logger.warning("Account %s failed %d times consecutively. Demoting from active pool.", obj.get('email'), obj['error_count'])
+            obj['state'] = 'exhausted'
+            await self.ensure_active_pool()
 
     async def recover_auth_failure(self, token: str) -> bool:
-        """When a token expires or fails auth, automatically re-login via Outlook IMAP OAuth."""
+        """当 token 失效或认证失败时，自动利用已保存的 Outlook OAuth 重新获取验证码完成登录。"""
         obj = next((x for x in self.tokens if x['token'] == token), None)
         if not obj:
             return False
@@ -275,7 +316,7 @@ class TokenManager:
             return False
 
     async def refresh_all(self):
-        """Refreshes active accounts (claims daily and updates balance)."""
+        """刷新 active 账号并同步额度"""
         logger.info("Starting refresh_all for active tokens...")
         for x in self.tokens:
             if x['state'] == 'active' and not x['disabled']:

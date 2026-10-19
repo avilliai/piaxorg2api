@@ -1,4 +1,4 @@
-import asyncio, json, os, random, string, threading, time
+﻿import asyncio, json, os, random, string, threading, time, logging
 from datetime import datetime, timezone
 from pathlib import Path
 import httpx
@@ -11,9 +11,19 @@ from app.services.outlook_email_service import (
 )
 from app.services.arting_client import claim_daily, get_balance
 
+logger = logging.getLogger(__name__)
+
 load_dotenv()
 BASE = os.getenv('PIAX_API_URL', 'https://piax-api.piax.org')
 _token_file_lock = asyncio.Lock()
+
+DEFAULT_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+    'Origin': 'https://www.piax.org',
+    'Referer': 'https://www.piax.org/',
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+}
 
 
 def get_today_str() -> str:
@@ -30,7 +40,7 @@ async def send_verify_code(email: str, client: httpx.AsyncClient):
         'email': email,
         'device': {'deviceType': 'pc', 'osPlatform': 'web'}
     }
-    r = await client.post(f'{BASE}/user-api/user/sendEmailVerifyCode', json=payload)
+    r = await client.post(f'{BASE}/user-api/user/sendEmailVerifyCode', json=payload, headers=DEFAULT_HEADERS)
     r.raise_for_status()
     data = r.json()
     if data.get('code') != 1:
@@ -45,7 +55,7 @@ async def submit_email_login(email: str, code: str, client: httpx.AsyncClient) -
         'channel': 'pia',
         'device': {'deviceType': 'pc', 'osPlatform': 'web'}
     }
-    r = await client.post(f'{BASE}/user-api/user/emailLogin', json=payload)
+    r = await client.post(f'{BASE}/user-api/user/emailLogin', json=payload, headers=DEFAULT_HEADERS)
     r.raise_for_status()
     data = r.json()
     if data.get('code') != 1 or not data.get('token'):
@@ -54,29 +64,32 @@ async def submit_email_login(email: str, code: str, client: httpx.AsyncClient) -
 
 
 async def register_account_from_record(email: str, password: str, client_id: str, refresh_token: str) -> dict:
-    async with httpx.AsyncClient(timeout=30) as client:
-        # 1. Get baseline message IDs per folder ('"Junk"' and 'INBOX')
+    timeout = httpx.Timeout(30.0, connect=15.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        # 1. 记录初始邮件 UID
         baseline_folders = await asyncio.to_thread(get_folder_highest_uids, email, client_id, refresh_token)
 
-        # 2. Request verification code from Piax
+        # 2. 发送验证码
         await send_verify_code(email, client)
 
-        # 3. Wait for code via Outlook IMAP OAuth
+        # 3. 等待验证码
         code = await wait_for_outlook_code(email, client_id, refresh_token, baseline_folders=baseline_folders)
 
-        # 4. Login to Piax and get JWT token
+        # 4. 登录换取 Token
         token = await submit_email_login(email, code, client)
 
-    # 5. Claim daily reward and get initial balance
+    # 5. 每日签到并获取初始积分
     today_str = get_today_str()
-    remaining = 0
+    remaining = 6000
     try:
         await claim_daily(token)
         bal_info = await get_balance(token)
         plan = bal_info.get('subscriptionPlan') or {}
-        remaining = plan.get('subscriptionBalance', 0) + plan.get('totalityBalance', 0)
+        bal = plan.get('subscriptionBalance', 0) + plan.get('totalityBalance', 0)
+        if bal > 0:
+            remaining = bal
     except Exception as e:
-        print(f"Warning: claim_daily or get_balance failed for new account {email}: {e}")
+        logger.warning("claim_daily or get_balance failed for new account %s: %s", email, e)
 
     return {
         "email": email,
@@ -93,14 +106,15 @@ async def register_account_from_record(email: str, password: str, client_id: str
 
 
 async def relogin_account(account: dict) -> str:
-    """When a token expires, reuse Outlook OAuth credentials to receive verify code and get a new JWT token."""
+    """当 Token 过期时，自动利用 Outlook OAuth 获取验证码重新登录并续期。"""
     email = account.get('email')
     client_id = account.get('client_id')
     refresh_token = account.get('refresh_token')
     if not email or not client_id or not refresh_token:
         raise ValueError(f"Account {email} lacks client_id or refresh_token for re-login")
 
-    async with httpx.AsyncClient(timeout=30) as client:
+    timeout = httpx.Timeout(30.0, connect=15.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
         baseline_folders = await asyncio.to_thread(get_folder_highest_uids, email, client_id, refresh_token)
         await send_verify_code(email, client)
         code = await wait_for_outlook_code(email, client_id, refresh_token, baseline_folders=baseline_folders)
@@ -111,7 +125,7 @@ async def relogin_account(account: dict) -> str:
     return new_token
 
 
-async def register_batch_from_file(account_file: str = None, count: int = 5) -> list[dict]:
+async def register_batch_from_file(account_file: str = None, count: int = 3) -> list[dict]:
     path = account_file or os.getenv('OUTLOOK_ACCOUNT_FILE', 'outlook_live_20261018_222014.txt')
     token_path = Path(os.getenv('TOKEN_FILE', 'data/tokens.json'))
 
@@ -120,22 +134,23 @@ async def register_batch_from_file(account_file: str = None, count: int = 5) -> 
         existing_emails = {x.get('email') for x in existing if x.get('email')}
 
     candidates = []
-    with open(path, encoding='utf-8-sig') as f:
-        for line in f:
-            parts = line.strip().split('----', 3)
-            if len(parts) == 4 and parts[0] not in existing_emails:
-                candidates.append(parts)
-            if len(candidates) >= count:
-                break
+    if os.path.exists(path):
+        with open(path, encoding='utf-8-sig') as f:
+            for line in f:
+                parts = line.strip().split('----', 3)
+                if len(parts) == 4 and parts[0] not in existing_emails:
+                    candidates.append(parts)
+                if len(candidates) >= count:
+                    break
 
     if not candidates:
-        print("No new candidate accounts to register.")
+        logger.info("No new candidate accounts to register from %s", path)
         return []
 
     registered = []
     for email, pwd, cid, rtok in candidates:
         try:
-            print(f"Registering standby account: {email} ...", flush=True)
+            logger.info("Auto-registering standby account: %s ...", email)
             acc = await register_account_from_record(email, pwd, cid, rtok)
             registered.append(acc)
             async with _token_file_lock:
@@ -143,11 +158,11 @@ async def register_batch_from_file(account_file: str = None, count: int = 5) -> 
                 acc['id'] = len(current_tokens) + 1
                 current_tokens.append(acc)
                 token_path.write_text(json.dumps(current_tokens, ensure_ascii=False, indent=2), encoding='utf-8')
-            print(f"Successfully registered {email}, balance: {acc['remaining']}", flush=True)
+            logger.info("Successfully registered %s, balance: %d", email, acc['remaining'])
         except Exception as e:
-            print(f"Failed to register {email}: {e}", flush=True)
+            logger.error("Failed to register %s: %s", email, e)
             if "too frequent" in str(e).lower() or "frequent" in str(e).lower():
-                print("Upstream registration rate-limit detected. Stopping batch registration gracefully to cool down.", flush=True)
+                logger.warning("Upstream registration rate-limit detected. Backing off.")
                 break
 
     return registered
